@@ -42,6 +42,16 @@ def test_device_bearer_is_admitted_only_on_session_gate(tmp_path):
     assert adapter._check_auth(request).status == 401
 
 
+def test_operator_key_with_device_prefix_retains_session_and_run_access(tmp_path):
+    operator_key = "hdev_operator-key-123456789"
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": operator_key}))
+    request = _Request(f"Bearer {operator_key}")
+
+    assert adapter._check_session_auth(request) is None
+    assert adapter._device_installation(request) == ""
+    assert adapter._check_run_auth(request, permission="dispatch") is None
+
+
 def test_device_session_gate_hides_another_installation_session(tmp_path):
     adapter, store, first, second = _adapter_with_two_devices(tmp_path)
     assert store.claim_session(first.installation_id, "limen_session_1") is True
@@ -75,6 +85,28 @@ def test_device_run_scope_isolated_per_installation(tmp_path):
     assert adapter._check_run_auth(second_request, permission="dispatch") is None
 
     assert adapter._run_idempotency_scope(first_request) != adapter._run_idempotency_scope(second_request)
+
+
+def test_device_rejects_foreign_previous_response_before_history_load(tmp_path):
+    adapter, store, first, second = _adapter_with_two_devices(tmp_path)
+    assert store.claim_session(first.installation_id, "owned-session") is True
+    assert store.claim_session(second.installation_id, "foreign-session") is True
+    adapter._response_store.put("resp_foreign", {
+        "session_id": "foreign-session",
+        "conversation_history": [{"role": "user", "content": "secret foreign history"}],
+    })
+
+    history, _instructions, stored_session_id, error = api_server_runs._resolve_conversation_history(
+        adapter,
+        {"previous_response_id": "resp_foreign", "session_id": "owned-session"},
+        "hello",
+        _openai_error=lambda message, **_kwargs: {"message": message},
+        response_session_allowed=lambda session_id: (
+            session_id == "owned-session" and store.owns_session(first.installation_id, session_id)),
+    )
+    assert history == []
+    assert stored_session_id is None
+    assert error is not None
 
 
 class _Response:

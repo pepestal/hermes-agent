@@ -27,6 +27,7 @@ _MAX_SECRET_LENGTH = 512
 _MAX_LABEL_LENGTH = 128
 _MAX_SESSION_ID_LENGTH = 256
 _DEFAULT_CREDENTIAL_TTL_SECONDS = 30 * 24 * 60 * 60
+_STREAM_LEASE_TTL_SECONDS = 60
 
 
 @dataclass(frozen=True)
@@ -97,6 +98,15 @@ class DeviceCredentialStore:
                 claimed_at REAL NOT NULL
             )"""
         )
+        self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS device_stream_leases (
+                lease_id TEXT PRIMARY KEY,
+                installation_id TEXT NOT NULL REFERENCES device_credentials(installation_id),
+                expires_at REAL NOT NULL
+            )"""
+        )
+        self._conn.execute("CREATE INDEX IF NOT EXISTS device_stream_leases_expiry "
+                           "ON device_stream_leases(expires_at)")
         self._conn.commit()
         self._tighten_permissions()
 
@@ -216,17 +226,20 @@ class DeviceCredentialStore:
 
     @contextmanager
     def active_credential_lease(self, credential: str) -> Iterator[DevicePrincipal | None]:
-        """Hold admission stable while one SSE write is committed to the socket.
+        """Acquire a cross-process SQLite lease for exactly one pending SSE write.
 
-        ``revoke`` shares this lock, so it cannot report success before a write already
-        admitted completes; every later write observes the revocation and is denied.
+        A revocation may succeed only after all active durable leases are released.
+        The lease does not hold a Python mutex across an ``await``; a process crash is
+        bounded by its expiry and therefore cannot block revocation indefinitely.
         """
         if not self._valid_secret(credential, _CREDENTIAL_PREFIX):
             yield None
             return
         now = float(self._now())
+        lease_id = secrets.token_urlsafe(24)
         try:
-            with self._lock:
+            with self._transaction():
+                self._conn.execute("DELETE FROM device_stream_leases WHERE expires_at <= ?", (now,))
                 row = self._conn.execute(
                     """SELECT installation_id, expires_at FROM device_credentials
                          WHERE credential_hash=? AND revoked_at IS NULL AND expires_at > ?""",
@@ -236,9 +249,23 @@ class DeviceCredentialStore:
                     DevicePrincipal(installation_id=str(row[0]), expires_at=float(row[1]))
                     if row else None
                 )
-                yield principal
+                if principal is not None:
+                    self._conn.execute(
+                        "INSERT INTO device_stream_leases(lease_id,installation_id,expires_at) VALUES(?,?,?)",
+                        (lease_id, principal.installation_id, now + _STREAM_LEASE_TTL_SECONDS),
+                    )
         except sqlite3.Error:
             yield None
+            return
+        try:
+            yield principal
+        finally:
+            try:
+                with self._transaction():
+                    self._conn.execute("DELETE FROM device_stream_leases WHERE lease_id=?", (lease_id,))
+            except sqlite3.Error:
+                # A later lease cleanup is safe; fail closed for subsequent writes.
+                pass
 
     def revoke(self, installation_id: str) -> bool:
         """Revoke an active device credential exactly once; repeat revocation is a safe no-op."""
@@ -246,8 +273,14 @@ class DeviceCredentialStore:
             return False
         now = float(self._now())
         with self._transaction():
+            self._conn.execute("DELETE FROM device_stream_leases WHERE expires_at <= ?", (now,))
             changed = self._conn.execute(
-                "UPDATE device_credentials SET revoked_at=? WHERE installation_id=? AND revoked_at IS NULL",
+                """UPDATE device_credentials SET revoked_at=?
+                     WHERE installation_id=? AND revoked_at IS NULL
+                       AND NOT EXISTS (
+                           SELECT 1 FROM device_stream_leases
+                            WHERE installation_id=device_credentials.installation_id
+                       )""",
                 (now, installation_id),
             ).rowcount
         return changed == 1

@@ -33,3 +33,16 @@ def test_device_session_ownership_survives_reopen_and_rejects_revoked_owner(tmp_
     reopened = DeviceCredentialStore(path, now=lambda: 1_000.0)
     assert reopened.owns_session(owner.installation_id, "limen_session_2") is False
     assert reopened.claim_session(owner.installation_id, "another_session") is False
+
+
+def test_cross_store_revocation_cannot_succeed_during_durable_stream_lease(tmp_path):
+    path = tmp_path / "device-credentials.db"
+    first, issued = _issued_store(tmp_path)
+    second = DeviceCredentialStore(path, now=lambda: 1_000.0)
+
+    with first.active_credential_lease(issued.credential) as principal:
+        assert principal is not None
+        assert second.revoke(issued.installation_id) is False
+        assert second.authenticate(issued.credential) is not None
+    assert second.revoke(issued.installation_id) is True
+    assert second.authenticate(issued.credential) is None

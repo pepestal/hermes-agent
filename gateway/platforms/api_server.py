@@ -1630,12 +1630,16 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return None
 
     def _check_session_auth(self, request: web.Request) -> Optional[web.Response]:
-        """Authenticate a narrow device bearer, otherwise retain normal operator auth."""
+        """Authenticate an operator bearer first, then a narrow device bearer."""
         auth_header = request.headers.get("Authorization", "")
-        if not auth_header.startswith("Bearer hdev_"):
+        token = auth_header[7:].strip() if auth_header.startswith("Bearer ") else ""
+        expected_key = self._expected_api_key()
+        if expected_key and hmac.compare_digest(token.encode(), expected_key.encode()):
+            return None
+        if not token.startswith("hdev_"):
             return self._check_auth(request)
         store = self._device_store()
-        issued = store.authenticate(auth_header[7:].strip()) if store is not None else None
+        issued = store.authenticate(token) if store is not None else None
         if issued is None:
             return self._device_auth_failed_response()
         request["hermes_device_installation"] = issued.installation_id
@@ -3154,11 +3158,15 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         include_hidden = bool(title_filter) and _coerce_request_bool(
             request.query.get("include_hidden"), default=False)
 
+        installation_id = self._device_installation(request)
+        query_limit = 1_000_000 if installation_id else limit
+        query_offset = 0 if installation_id else offset
+
         async def _list() -> list:
             # include_pinned back-fills pins past the recency window; search_query pushes the
             # title needle into SQL (substring) so a hidden/old row is found, exact match below.
             rows = await asyncio.to_thread(
-                db.list_sessions_rich, source=source, limit=limit, offset=offset,
+                db.list_sessions_rich, source=source, limit=query_limit, offset=query_offset,
                 include_children=include_children, order_by_last_active=True, include_pinned=True,
                 search_query=title_filter, include_hidden=include_hidden)
             if title_filter:
@@ -3166,12 +3174,14 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return rows
 
         sessions = await _list()
-        installation_id = self._device_installation(request)
+        device_has_more = False
         if installation_id:
             store = self._device_store()
             if store is None:
                 return self._device_auth_failed_response()
             sessions = [session for session in sessions if store.owns_session(installation_id, session["id"])]
+            device_has_more = len(sessions) > offset + limit
+            sessions = sessions[offset:offset + limit]
         if title_filter and not sessions and not installation_id:
             # A canonical Bot Chat auto-archived by the orphan reaper would make `hermes peer dm`
             # mint transient sessions: resurrect and re-list; deliberate archives stay put.
@@ -3197,7 +3207,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         windowed = sum(1 for s in sessions if not s.get("pinned"))
         return web.json_response({
             "object": "list", "data": [self._session_response(s) for s in sessions],
-            "limit": limit, "offset": offset, "has_more": windowed >= limit})
+            "limit": limit, "offset": offset,
+            "has_more": device_has_more if installation_id else windowed >= limit})
 
     @_require_session_auth
     async def _handle_create_session(self, request: web.Request) -> web.Response:

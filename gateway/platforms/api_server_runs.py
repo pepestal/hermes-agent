@@ -449,7 +449,8 @@ def _durable_run_status(self, request: web.Request, run_id: str) -> dict[str, An
 
 
 def _resolve_conversation_history(
-    self, body: dict, raw_input: Any, *, _openai_error
+    self, body: dict, raw_input: Any, *, _openai_error,
+    response_session_allowed: Callable[[str], bool] | None = None,
 ) -> tuple[list[dict[str, str]], Any, Any, web.Response | None]:
     """Return ``(history, instructions, stored_session_id, error)``; precedence:
     ``conversation_history`` > ``previous_response_id`` chain > all-but-last ``input`` messages."""
@@ -473,8 +474,13 @@ def _resolve_conversation_history(
     if not conversation_history and previous_response_id:
         stored = self._current_response_store().get(previous_response_id)
         if stored:
-            conversation_history = list(stored.get("conversation_history", []))
             stored_session_id = stored.get("session_id")
+            if (response_session_allowed is not None
+                    and (not isinstance(stored_session_id, str)
+                         or not response_session_allowed(stored_session_id))):
+                return [], instructions, None, _json_error(
+                    _openai_error, "Previous response not found", status=404)
+            conversation_history = list(stored.get("conversation_history", []))
             if instructions is None:
                 instructions = stored.get("instructions")
     if not conversation_history and isinstance(raw_input, list) and len(raw_input) > 1:
@@ -690,21 +696,36 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
         turn_author = _api_server._request_turn_author(body)
     except ValueError as exc:
         return _json_error(_openai_error, str(exc), code="invalid_author", status=400)
+    device_installation = self._device_installation(request)
+    device_store = self._device_store() if device_installation else None
+    requested_session_id = body.get("session_id")
+
+    def _device_response_session_allowed(response_session_id: str) -> bool:
+        return bool(
+            device_store is not None
+            and device_store.owns_session(device_installation, response_session_id)
+            and (requested_session_id is None or requested_session_id == response_session_id)
+        )
+
     conversation_history, instructions, stored_session_id, history_err = (
-        _resolve_conversation_history(self, body, raw_input, _openai_error=_openai_error))
+        _resolve_conversation_history(
+            self, body, raw_input, _openai_error=_openai_error,
+            response_session_allowed=_device_response_session_allowed if device_installation else None))
     if history_err is not None:
         return history_err
     previous_response_id = body.get("previous_response_id")
     session_id = body.get("session_id") or stored_session_id
-    device_installation = self._device_installation(request)
     if device_installation:
-        if not isinstance(session_id, str) or not session_id:
-            return _json_error(
-                _openai_error, "Device runs require an owned session_id",
-                code="device_session_required", status=400)
-        store = self._device_store()
-        if store is None or not store.owns_session(device_installation, session_id):
-            return _run_not_found(_openai_error, str(session_id))
+        store = device_store
+        # A response chain is an authority-bearing history source. Its stored session
+        # must itself belong to this device even if the request names another owned one.
+        if (not isinstance(session_id, str) or not session_id or store is None
+                or not store.owns_session(device_installation, session_id)
+                or (stored_session_id is not None and
+                    (not isinstance(stored_session_id, str)
+                     or not store.owns_session(device_installation, stored_session_id)
+                     or stored_session_id != session_id))):
+            return _run_not_found(_openai_error, str(session_id or stored_session_id or ""))
     route = self._resolve_route(body.get("model"))
     agent_overrides = _api_server._request_agent_overrides(body, virtual_model=self._model_name)
     selection_error = self._request_route_conflict_error(
