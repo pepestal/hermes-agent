@@ -98,6 +98,7 @@ _CAPABILITY_ENDPOINTS = (
     ("session_model_lock", ("POST", "/api/sessions/{session_id}/model")),
     ("browser_control_register", ("POST", "/v1/browser-control/register")),
     ("browser_control_ws", ("GET", "/v1/browser-control/ws")),
+    ("device_pairing_consume", ("POST", "/v1/device-pairings/consume")),
     ("artifact_upload", ("POST", "/v1/artifacts/upload")),
     ("artifact_download", ("GET", "/v1/artifacts/download/{artifact_id}")))
 _BROWSER_CONTROL_WS_PROTOCOL = "hermes-browser-control-v1"
@@ -1805,6 +1806,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("GET", "/v1/models", self._handle_models),
             ("GET", "/api/model/options", self._handle_model_options),
             ("GET", "/v1/capabilities", self._handle_capabilities),
+            # A short-lived pairing secret is its own bearer; it is never logged or persisted
+            # outside DeviceCredentialStore and cannot mint operator authority.
+            ("POST", "/v1/device-pairings/consume", self._handle_device_pairing_consume),
             # Browser-control (gated on browser.extension_control.enabled + API key): POST
             # mints a short-lived ticket, WS consumes it; artifacts are bounded + scope-bound.
             ("POST", "/v1/browser-control/register", self._handle_browser_control_register),
@@ -2588,7 +2592,35 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             logger.exception("[%s] GET /api/model/options failed", self.name)
             return _error_response("Failed to list model options.", 500, code="model_options_failed")
 
-    @_require_auth
+    async def _handle_device_pairing_consume(self, request: web.Request) -> web.Response:
+        """Atomically exchange one local-operator pairing secret for a device credential.
+
+        This endpoint deliberately accepts no operator bearer and returns only the new
+        device credential once. Clients must treat its JSON body as secret material and
+        must not use it from browser storage.
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            return _error_response("Invalid JSON in request body", 400, code="invalid_json")
+        if not isinstance(body, dict):
+            return _error_response("Request body must be a JSON object", 400, code="invalid_request")
+        pairing_secret = body.get("pairing_secret")
+        if not isinstance(pairing_secret, str):
+            return _error_response("pairing_secret must be a string", 400, code="invalid_pairing")
+        store = self._device_store()
+        issued = store.consume_pairing(pairing_secret) if store is not None else None
+        if issued is None:
+            return _error_response("Pairing secret is invalid, expired, or already consumed", 401,
+                                   err_type="device_auth_error", code="pairing_consume_failed")
+        return web.json_response({
+            "object": "hermes.device_credential",
+            "installation_id": issued.installation_id,
+            "credential": issued.credential,
+            "expires_at": issued.expires_at,
+        }, status=201)
+
+    @_require_session_auth
     async def _handle_capabilities(self, request: web.Request) -> web.Response:
         """GET /v1/capabilities — the stable, machine-readable API surface for external UIs."""
         return web.json_response({

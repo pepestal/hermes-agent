@@ -20,6 +20,15 @@ class _Request(dict):
         self.transport = None
 
 
+class _JsonRequest(_Request):
+    def __init__(self, payload):
+        super().__init__("")
+        self._payload = payload
+
+    async def json(self):
+        return self._payload
+
+
 def _adapter_with_two_devices(tmp_path: Path):
     adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "operator-secret-1234"}))
     store = DeviceCredentialStore(tmp_path / "device-credentials.db", now=lambda: 1_000.0)
@@ -30,6 +39,22 @@ def _adapter_with_two_devices(tmp_path: Path):
     assert first is not None and second is not None
     adapter._device_credential_store = store
     return adapter, store, first, second
+
+
+def test_device_pairing_consume_is_atomic_and_returns_credential_once(tmp_path):
+    adapter, store, _first, _second = _adapter_with_two_devices(tmp_path)
+    pairing = store.create_pairing("Fresh Limen", expires_in_seconds=60)
+
+    async def _consume():
+        response = await adapter._handle_device_pairing_consume(_JsonRequest({"pairing_secret": pairing}))
+        return response
+
+    async def _race():
+        return await asyncio.gather(_consume(), _consume())
+
+    import asyncio
+    first, second = asyncio.run(_race())
+    assert sorted([first.status, second.status]) == [201, 401]
 
 
 def test_device_bearer_is_admitted_only_on_session_gate(tmp_path):
