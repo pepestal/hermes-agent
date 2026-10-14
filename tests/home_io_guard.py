@@ -11,6 +11,34 @@ import sqlite3
 import sys
 import threading
 
+_CHECKOUT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _linked_worktree_metadata_prefixes(root: Path) -> tuple[Path, ...]:
+    """Return this checkout's linked-worktree Git metadata directory, if any.
+
+    A normal checkout keeps ``.git`` under ``root`` and is already covered by
+    the source-prefix exemption. A linked worktree replaces it with a gitdir
+    file pointing at the primary checkout's ``.git/worktrees/<name>`` metadata.
+    That directory is source-control metadata for *this* checkout, not Hermes
+    state, and startup probes its interrupted-update marker before tests run.
+    """
+    git_ref = root / ".git"
+    if not git_ref.is_file():
+        return ()
+    try:
+        label, raw_path = git_ref.read_text(encoding="utf-8").split(":", 1)
+        if label.strip().lower() != "gitdir":
+            return ()
+        metadata = Path(raw_path.strip())
+        if not metadata.is_absolute():
+            metadata = git_ref.parent / metadata
+        return (metadata.resolve(),)
+    except (OSError, ValueError):
+        return ()
+
+
+_CHECKOUT_METADATA_PREFIXES = _linked_worktree_metadata_prefixes(_CHECKOUT_ROOT)
 _INTERPRETER_PREFIXES = tuple({
     Path(p).resolve() for p in (sys.prefix, sys.base_prefix, sys.exec_prefix, sys.base_exec_prefix)
 } | {
@@ -23,8 +51,8 @@ _INTERPRETER_PREFIXES = tuple({
     # INSTALL_DIR=$HERMES_HOME/hermes-agent). Reading test data, sources for tracebacks, or the
     # checkout's own .venv is not Hermes state; without this every run from a default install
     # trips on its first traceback.
-    Path(__file__).resolve().parent.parent,
-})
+    _CHECKOUT_ROOT,
+} | set(_CHECKOUT_METADATA_PREFIXES))
 # The same prefixes as plain strings for the check() fast path. PurePath comparison folds case on
 # Windows; ``os.path.normcase`` (identity on POSIX) reproduces that for string compares. Prefixes
 # resolve once at import, as before: they are fixed for the process lifetime.

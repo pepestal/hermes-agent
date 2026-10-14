@@ -200,6 +200,23 @@ def test_checkout_inside_a_guarded_root_is_not_hermes_state():
         guard.check(PROJECT_ROOT.parent / "config.yaml")
 
 
+def test_linked_worktree_git_metadata_is_not_hermes_state():
+    """A linked worktree keeps its Git metadata under the primary checkout's
+    ``.git/worktrees`` directory. That metadata belongs to the source checkout,
+    just as the ordinary checkout's in-tree ``.git`` directory does; reading the
+    interrupted-update marker during import must not trip the real-home guard."""
+    from tests.home_io_guard import HomeIOGuard, _CHECKOUT_METADATA_PREFIXES
+
+    git_file = PROJECT_ROOT / ".git"
+    if not git_file.is_file():
+        pytest.skip("this checkout is not a linked worktree")
+    prefix = Path(git_file.read_text(encoding="utf-8").split(":", 1)[1].strip()).resolve()
+    assert prefix in _CHECKOUT_METADATA_PREFIXES
+
+    guard = HomeIOGuard(lambda: [PROJECT_ROOT.parent])
+    guard.check(prefix / "hermes-update-pull", metadata=True)
+
+
 def test_hermes_exported_scratch_tmp_is_not_the_test_temp_root(tmp_path):
     """A Hermes-launched shell hands pytest TMPDIR=<home>/cache/scratch (tagged by
     HERMES_SCRATCH_DIR). With that home guarded, honoring it would put the session
