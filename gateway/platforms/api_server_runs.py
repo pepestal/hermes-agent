@@ -365,6 +365,12 @@ def _run_idempotency_scope(self, request: web.Request, *, _api_server) -> str:
         parts = (claims[k] for k in (
             "room_id", "home_install_id", "authority_gateway_id", "authority_epoch",
             "member_id", "target_install_id", "target_profile"))
+    elif self._device_installation(request):
+        parts = (
+            _api_server._api_request_profile.get() or "default",
+            "device",
+            self._device_installation(request),
+        )
     else:
         parts = (_api_server._api_request_profile.get() or "default",
                  self._expected_api_key() or "unauthenticated-test-listener")
@@ -373,12 +379,36 @@ def _run_idempotency_scope(self, request: web.Request, *, _api_server) -> str:
 
 def _check_run_auth(self, request: web.Request, *, permission: str, _api_server) -> web.Response | None:
     if not self._room_grant_token(request):
-        return self._check_auth(request)
+        return (
+            self._check_session_auth(request)
+            if request.headers.get("Authorization", "").startswith("Bearer hdev_")
+            else self._check_auth(request)
+        )
     try:
         self._room_grant_claims(request, permission=permission)
     except Exception as exc:
         return _room_grant_error_response(exc, _openai_error=_api_server._openai_error)
     return None
+
+
+class _DeviceStreamRevoked(Exception):
+    """A device credential ceased to authorize an SSE write."""
+
+
+async def _write_device_scoped_stream(self, request: web.Request, response, data: bytes, *, _api_server) -> None:
+    """Write under an active device lease; revocation serializes with this write."""
+    installation_id = self._device_installation(request)
+    if not installation_id:
+        await response.write(data)
+        return
+    store = self._device_store()
+    credential = request.headers.get("Authorization", "")[7:].strip()
+    if store is None:
+        raise _DeviceStreamRevoked()
+    with store.active_credential_lease(credential) as principal:
+        if principal is None or principal.installation_id != installation_id:
+            raise _DeviceStreamRevoked()
+        await response.write(data)
 
 
 def _owner_alive(owner_pid: int, owner_started: int) -> bool:
@@ -666,6 +696,15 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
         return history_err
     previous_response_id = body.get("previous_response_id")
     session_id = body.get("session_id") or stored_session_id
+    device_installation = self._device_installation(request)
+    if device_installation:
+        if not isinstance(session_id, str) or not session_id:
+            return _json_error(
+                _openai_error, "Device runs require an owned session_id",
+                code="device_session_required", status=400)
+        store = self._device_store()
+        if store is None or not store.owns_session(device_installation, session_id):
+            return _run_not_found(_openai_error, str(session_id))
     route = self._resolve_route(body.get("model"))
     agent_overrides = _api_server._request_agent_overrides(body, virtual_model=self._model_name)
     selection_error = self._request_route_conflict_error(
@@ -1063,7 +1102,7 @@ async def _handle_get_run(self, request: web.Request, *, _api_server) -> web.Res
 
 async def _handle_run_events(self, request: web.Request, *, _api_server) -> web.StreamResponse:
     """GET /v1/runs/{run_id}/events — stream structured agent lifecycle events."""
-    auth_err = self._check_auth(request)
+    auth_err = self._check_run_auth(request, permission="status")
     if auth_err:
         return auth_err
     run_id = request.match_info["run_id"]
@@ -1092,7 +1131,7 @@ async def _handle_run_events(self, request: web.Request, *, _api_server) -> web.
     async def _write(data: bytes) -> None:
         try:
             async with asyncio.timeout(_RUN_STREAM_WRITE_TIMEOUT):
-                await response.write(data)
+                await _write_device_scoped_stream(self, request, response, data, _api_server=_api_server)
         except TimeoutError:
             with suppress(Exception):
                 response.force_close()

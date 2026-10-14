@@ -935,6 +935,8 @@ def _admit_api_agent_request(handler):
         auth_err = (
             self._check_run_auth(request, permission="dispatch")
             if _api_runs._uses_room_run_auth(self, request)
+            else self._check_run_auth(request, permission="dispatch")
+            if request.path.endswith("/v1/runs")
             else self._check_auth(request))
         if auth_err:
             return auth_err
@@ -964,6 +966,21 @@ def _require_auth(handler):
     @wraps(handler)
     async def _wrapped(self, request, *args, **kwargs):
         auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        return await handler(self, request, *args, **kwargs)
+    return _wrapped
+
+
+def _require_session_auth(handler):
+    """Admit an operator key or a valid Limen device credential.
+
+    Device principals are restricted to handlers which enforce persistent session
+    ownership. They do not inherit general API-server authority.
+    """
+    @wraps(handler)
+    async def _wrapped(self, request, *args, **kwargs):
+        auth_err = self._check_session_auth(request)
         if auth_err:
             return auth_err
         return await handler(self, request, *args, **kwargs)
@@ -1231,6 +1248,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         # which is per request -> unbounded). Recovers a transient empty model resolution.
         self._last_resolved_model: dict[str, str] = {}
         self._session_db_lock: Optional[asyncio.Lock] = None  # single-flight for lazy init
+        # Lazy and per-profile: registry creation must not happen merely because
+        # an ordinary API server starts.
+        self._device_credential_store: Optional[Any] = None  # explicit test injection
+        self._device_credential_stores: dict[str, Any] = {}
+        self._device_credential_store_lock = threading.Lock()
         self._max_concurrent_runs: int = self._resolve_max_concurrent_runs()  # 0 disables
         self._history_tool_output_max_chars = self._resolve_api_server_int(
             "history_tool_output_max_chars", default=0)
@@ -1579,6 +1601,60 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 return None
         logger.warning("API server rejected invalid API key: %s", self._request_audit_log_suffix(request))
         return self._auth_failed_response()
+
+    @staticmethod
+    def _device_auth_failed_response() -> web.Response:
+        return web.json_response(
+            {"error": {"message": "Invalid or expired device credential", "type": "device_auth_error",
+                       "code": "device_auth_failed"}},
+            status=401)
+
+    def _device_store(self) -> Optional[Any]:
+        """Return the active profile's durable device registry, failing closed on errors."""
+        injected = self._device_credential_store
+        if injected is not None:
+            return injected
+        try:
+            from hermes_constants import get_hermes_home
+            from gateway.device_credentials import DeviceCredentialStore
+            home = get_hermes_home()
+            key = str(home)
+            with self._device_credential_store_lock:
+                store = self._device_credential_stores.get(key)
+                if store is None:
+                    store = DeviceCredentialStore(home / "device_credentials.db")
+                    self._device_credential_stores[key] = store
+                return store
+        except Exception:
+            logger.warning("Device credential registry unavailable")
+            return None
+
+    def _check_session_auth(self, request: web.Request) -> Optional[web.Response]:
+        """Authenticate a narrow device bearer, otherwise retain normal operator auth."""
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer hdev_"):
+            return self._check_auth(request)
+        store = self._device_store()
+        issued = store.authenticate(auth_header[7:].strip()) if store is not None else None
+        if issued is None:
+            return self._device_auth_failed_response()
+        request["hermes_device_installation"] = issued.installation_id
+        return None
+
+    @staticmethod
+    def _device_installation(request: web.Request) -> str:
+        value = request.get("hermes_device_installation", "")
+        return value if isinstance(value, str) else ""
+
+    def _device_owns_session_or_404(self, request: web.Request, session_id: str) -> Optional[web.Response]:
+        installation_id = self._device_installation(request)
+        if not installation_id:
+            return None
+        store = self._device_store()
+        if store is None or not store.owns_session(installation_id, session_id):
+            # Avoid session-existence disclosure across device boundaries.
+            return _error_response("Session not found", 404, code="session_not_found")
+        return None
 
     @staticmethod
     def _normalize_callback_platform(value: str) -> str:
@@ -3062,7 +3138,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             self, session_id=session_id, text=text, profile=profile,
             notification_category=notification_category, _api_server=sys.modules[__name__])
 
-    @_require_auth
+    @_require_session_auth
     async def _handle_list_sessions(self, request: web.Request) -> web.Response:
         """GET /api/sessions — list persisted Hermes sessions."""
         db = await self._ensure_session_db_async()
@@ -3090,7 +3166,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return rows
 
         sessions = await _list()
-        if title_filter and not sessions:
+        installation_id = self._device_installation(request)
+        if installation_id:
+            store = self._device_store()
+            if store is None:
+                return self._device_auth_failed_response()
+            sessions = [session for session in sessions if store.owns_session(installation_id, session["id"])]
+        if title_filter and not sessions and not installation_id:
             # A canonical Bot Chat auto-archived by the orphan reaper would make `hermes peer dm`
             # mint transient sessions: resurrect and re-list; deliberate archives stay put.
             try:
@@ -3117,7 +3199,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             "object": "list", "data": [self._session_response(s) for s in sessions],
             "limit": limit, "offset": offset, "has_more": windowed >= limit})
 
-    @_require_auth
+    @_require_session_auth
     async def _handle_create_session(self, request: web.Request) -> web.Response:
         """POST /api/sessions -- create an empty Hermes session row. Existence check, insert and
         title handling run as ONE off-loop write so concurrent same-id creates can't both 201."""
@@ -3183,14 +3265,26 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return _error_response(f"Session already exists: {session_id}", 409, code="session_exists")
         if err and err.startswith("title:"):
             return _error_response(err[len("title:"):], 400, code="invalid_title")
+        installation_id = self._device_installation(request)
+        if installation_id:
+            store = self._device_store()
+            if store is None or not store.claim_session(installation_id, session_id):
+                # No messages exist yet; do not leave an inaccessible row if the
+                # separate ownership registry failed closed after session creation.
+                await asyncio.to_thread(db.delete_session, session_id, exclude_active_write_guards=True)
+                return self._device_auth_failed_response()
         return web.json_response({"object": "hermes.session", "session": self._session_response(session)}, status=201)
 
-    @_require_auth
+    @_require_session_auth
     async def _handle_get_session(self, request: web.Request) -> web.Response:
         """GET /api/sessions/{session_id}."""
-        session, err = await self._get_existing_session_or_404(request.match_info["session_id"])
+        session_id = request.match_info["session_id"]
+        session, err = await self._get_existing_session_or_404(session_id)
         if err:
             return err
+        owner_err = self._device_owns_session_or_404(request, session_id)
+        if owner_err:
+            return owner_err
         return web.json_response({"object": "hermes.session", "session": self._session_response(session)})
 
     @_require_auth
@@ -3266,13 +3360,16 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 await asyncio.to_thread(store.remove_by_session_id, session_id)
         return web.json_response({"object": "hermes.session.deleted", "id": session_id, "deleted": bool(deleted)})
 
-    @_require_auth
+    @_require_session_auth
     async def _handle_session_messages(self, request: web.Request) -> web.Response:
         """GET /api/sessions/{session_id}/messages."""
         session_id = request.match_info["session_id"]
         _, err = await self._get_existing_session_or_404(session_id)
         if err:
             return err
+        owner_err = self._device_owns_session_or_404(request, session_id)
+        if owner_err:
+            return owner_err
         db = await self._ensure_session_db_async()
         resolved_id = await asyncio.to_thread(db.resolve_resume_session_id, session_id)
         raw_limit, raw_offset = request.query.get("limit"), request.query.get("offset", "0")
