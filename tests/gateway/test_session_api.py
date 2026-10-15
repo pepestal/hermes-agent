@@ -10,6 +10,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import PlatformConfig
+from gateway.device_credentials import DeviceCredentialStore
 from gateway.platforms.api_server import APIServerAdapter
 from hermes_state import SessionDB
 
@@ -67,6 +68,7 @@ async def test_capabilities_advertises_session_control_surface(adapter):
     assert features["session_chat"] is True
     assert features["session_chat_streaming"] is True
     assert features["session_fork"] is True
+    assert features["session_archive_listing"] is True
     assert features["run_steer"] is True
     assert data["endpoints"]["sessions"] == {"method": "GET", "path": "/api/sessions"}
     assert data["endpoints"]["session_chat_stream"] == {
@@ -200,6 +202,57 @@ async def test_list_sessions_resurrects_bot_chat_off_the_event_loop(adapter, ses
     assert set(call_threads) == {"get_session_by_title", "unarchive_recoverable_session"}
     assert all(thread_id != loop_thread for thread_id in call_threads.values())
     assert not session_db.get_session(session_id)["archived"]
+
+
+@pytest.mark.asyncio
+async def test_list_sessions_archive_filter_returns_only_archived_rows(adapter, session_db):
+    active_id = session_db.create_session("active-session", "api_server")
+    archived_id = session_db.create_session("archived-session", "api_server")
+    assert session_db.set_session_archived(archived_id, True)
+    app = _create_session_app(adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        active_response = await cli.get("/api/sessions?archive=active")
+        archived_response = await cli.get("/api/sessions?archive=archived")
+        invalid_response = await cli.get("/api/sessions?archive=all")
+
+        active = await active_response.json()
+        archived = await archived_response.json()
+
+    assert active_response.status == 200
+    assert archived_response.status == 200
+    assert invalid_response.status == 400
+    assert active_id in {session["id"] for session in active["data"]}
+    assert archived_id not in {session["id"] for session in active["data"]}
+    assert [session["id"] for session in archived["data"]] == [archived_id]
+
+
+@pytest.mark.asyncio
+async def test_device_archive_listing_hides_another_installations_archived_session(adapter, session_db, tmp_path):
+    store = DeviceCredentialStore(tmp_path / "devices.db")
+    first_pairing = store.create_pairing("Limen web", expires_in_seconds=60)
+    second_pairing = store.create_pairing("Limen Android", expires_in_seconds=60)
+    first = store.consume_pairing(first_pairing)
+    second = store.consume_pairing(second_pairing)
+    assert first is not None and second is not None
+    adapter._device_credential_store = store
+    first_id = session_db.create_session("first-archived", "api_server")
+    second_id = session_db.create_session("second-archived", "api_server")
+    assert session_db.set_session_archived(first_id, True)
+    assert session_db.set_session_archived(second_id, True)
+    assert store.claim_session(first.installation_id, first_id)
+    assert store.claim_session(second.installation_id, second_id)
+    app = _create_session_app(adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.get(
+            "/api/sessions?archive=archived",
+            headers={"Authorization": f"Bearer {first.credential}"},
+        )
+        payload = await response.json()
+
+    assert response.status == 200
+    assert [session["id"] for session in payload["data"]] == [first_id]
 
 
 @pytest.mark.asyncio

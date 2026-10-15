@@ -69,7 +69,7 @@ _STATIC_FEATURE_FLAGS = {
     "run_status": True, "run_events_sse": True, "run_stop": True, "run_steer": True,
     "run_approval_response": True, "tool_progress_events": True, "approval_events": True,
     "session_resources": True, "model_options": True, "session_chat": True,
-    "session_chat_streaming": True, "session_fork": True, "session_model_lock": True,
+    "session_chat_streaming": True, "session_fork": True, "session_archive_listing": True, "session_model_lock": True,
     "reasoning_streaming": True,
     "admin_config_rw": False, "jobs_admin": False, "memory_write_api": False,
     "skills_api": True, "audio_api": False, "realtime_voice": False,
@@ -3182,6 +3182,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return self._session_db_unavailable()
         limit = self._parse_nonnegative_int(request.query.get("limit"), default=50, maximum=200)
         offset = self._parse_nonnegative_int(request.query.get("offset"), default=0, maximum=1_000_000)
+        archive = request.query.get("archive", "active")
+        if archive not in {"active", "archived"}:
+            return _error_response("archive must be 'active' or 'archived'", 400, code="invalid_archive_filter")
         source = request.query.get("source") or None
         include_children = _coerce_request_bool(request.query.get("include_children"), default=False)
         # Exact-title lookup (`hermes peer dm` -> canonical "Bot Chat"). include_hidden is honored
@@ -3200,7 +3203,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             rows = await asyncio.to_thread(
                 db.list_sessions_rich, source=source, limit=query_limit, offset=query_offset,
                 include_children=include_children, order_by_last_active=True, include_pinned=True,
-                search_query=title_filter, include_hidden=include_hidden)
+                search_query=title_filter, include_hidden=include_hidden,
+                include_archived=archive == "archived", archived_only=archive == "archived")
             if title_filter:
                 rows = [s for s in rows if (s.get("title") or "").strip() == title_filter]
             return rows
