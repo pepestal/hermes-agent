@@ -21,7 +21,11 @@ from fastapi.responses import StreamingResponse
 from hermes_cli.session_listing import subagent_listing_scope
 from hermes_cli.web_deps import late
 from hermes_cli.web_server_gateway import _strip_session_list_rows
-from hermes_cli.web_server_sessions import _maybe_auto_archive_for_profile, _session_latest_descendant
+from hermes_cli.web_server_sessions import (
+    SessionStoreReadOnlyUnavailableError,
+    _maybe_auto_archive_for_profile,
+    _session_latest_descendant,
+)
 from hermes_cli.web_models import (
     BulkDeleteSessions, SessionImport, SessionOwnerBackfill, SessionPrune, SessionRename)
 from hermes_cli.web_routers._common import (
@@ -174,12 +178,11 @@ def _resolve_session_id(db, session_id: str) -> Optional[str]:
 
 # ``le=100`` on limit: an unbounded limit lets one request drag every session
 # row (plus correlated-subquery preview work) out of SQLite in a single hit.
-@list_router.get("/api/sessions")
-def get_sessions(
+def _list_sessions(
     limit: int = Query(20, ge=0, le=100), offset: int = Query(0, ge=0), min_messages: int = 0,
     archived: str = "exclude", order: str = "created", source: str | None = None, sources: str | None = None,
     exclude_sources: str | None = None, cwd_prefix: str | None = None, full: bool = False,
-    profile: Optional[str] = None):
+    profile: Optional[str] = None, *, auto_archive: bool):
     """List sessions.
 
     ``order=recent`` sorts by latest activity across the compression chain, so
@@ -195,8 +198,13 @@ def get_sessions(
     try:
         # Auto-archive is the only write on this GET path: run it on its own
         # maintenance connection, then open the listing connection read-only.
-        _maybe_auto_archive_for_profile(profile)
-        db = _open_session_db_for_profile(profile, read_only=True)
+        if auto_archive:
+            _maybe_auto_archive_for_profile(profile)
+        db = _open_session_db_for_profile(
+            profile,
+            read_only=True,
+            strict_read_only=not auto_archive,
+        )
         try:
             min_message_count = max(0, min_messages)
             archived_only = archived == "only"
@@ -242,6 +250,9 @@ def get_sessions(
             db.close()
     except HTTPException:
         raise
+    except SessionStoreReadOnlyUnavailableError as exc:
+        _log.warning("GET /api/sessions/read-only unavailable: %s", exc)
+        raise HTTPException(status_code=503, detail="Session store is unavailable for read-only listing") from exc
     except sqlite3.OperationalError as exc:
         _log.exception("GET /api/sessions failed")
         # 503, not 500: the store is busy, not gone — the desktop keeps its
@@ -266,9 +277,31 @@ def get_sessions(
         # RuntimeError family, not sqlite3: same 503 payload as the analytics reads (#110054).
         with corrupt_store_as_status(_session_db_path_for_profile(profile)):
             raise
-    except Exception:
+    except Exception:  # health: allow BLE001 -- HTTP boundary logs an unexpected listing failure before returning a generic safe error
         _log.exception("GET /api/sessions failed")
         raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@list_router.get("/api/sessions")
+def get_sessions(
+    limit: int = Query(20, ge=0, le=100), offset: int = Query(0, ge=0), min_messages: int = 0,
+    archived: str = "exclude", order: str = "created", source: str | None = None, sources: str | None = None,
+    exclude_sources: str | None = None, cwd_prefix: str | None = None, full: bool = False,
+    profile: Optional[str] = None):
+    return _list_sessions(
+        limit, offset, min_messages, archived, order, source, sources, exclude_sources, cwd_prefix, full, profile,
+        auto_archive=True)
+
+
+@list_router.get("/api/sessions/read-only")
+def get_sessions_read_only(
+    limit: int = Query(20, ge=0, le=100), offset: int = Query(0, ge=0), min_messages: int = 0,
+    archived: str = "exclude", order: str = "created", source: str | None = None, sources: str | None = None,
+    exclude_sources: str | None = None, cwd_prefix: str | None = None, full: bool = False,
+    profile: Optional[str] = None):
+    return _list_sessions(
+        limit, offset, min_messages, archived, order, source, sources, exclude_sources, cwd_prefix, full, profile,
+        auto_archive=False)
 
 
 def _is_compression_edge(child: dict, parent: dict) -> bool:

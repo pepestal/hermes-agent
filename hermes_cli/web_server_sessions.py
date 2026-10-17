@@ -103,18 +103,24 @@ _session_db_heal_exhausted: set = set()
 _session_db_heal_warned: set = set()
 
 
+class SessionStoreReadOnlyUnavailableError(RuntimeError):
+    """A strict read-only caller found a store that would need a write to open."""
+
+
 def _is_stale_schema_error(exc: BaseException) -> bool:
     message = str(exc).lower()
     return "no such table" in message or "no such column" in message
 
 
-def _open_session_db_at_path(db_path: Path, *, read_only: bool):
+def _open_session_db_at_path(db_path: Path, *, read_only: bool, strict_read_only: bool = False):
     """Open a SessionDB at an explicit path with an explicit access mode.
 
-    Read-only opens bootstrap a missing/zero-byte store once and heal a stale or
-    malformed schema through ONE writable open before reopening read-only; the
-    healthy read path never takes a write lock.  Tables outside SCHEMA_SQL
-    (telemetry ``tel_*``, FTS shadow tables) are outside both probe and heal.
+    Read-only opens normally bootstrap a missing/zero-byte store once and heal
+    a stale or malformed schema through ONE writable open before reopening
+    read-only. ``strict_read_only`` instead refuses any store that would need
+    such maintenance. The healthy read path never takes a write lock. Tables
+    outside SCHEMA_SQL (telemetry ``tel_*``, FTS shadow tables) are outside
+    both probe and heal.
     """
     import sqlite3
 
@@ -135,6 +141,10 @@ def _open_session_db_at_path(db_path: Path, *, read_only: bool):
         except OSError:
             return False
 
+    if strict_read_only and _needs_bootstrap():
+        raise SessionStoreReadOnlyUnavailableError(
+            "Session store is not initialized; read-only access will not create it")
+
     if _needs_bootstrap():
         with _session_db_bootstrap_lock:
             if _needs_bootstrap():
@@ -154,6 +164,13 @@ def _open_session_db_at_path(db_path: Path, *, read_only: bool):
                 db.close()
                 raise
         return db
+
+    if strict_read_only:
+        try:
+            return _open_probed()
+        except (sqlite3.DatabaseError, UnicodeDecodeError) as exc:
+            raise SessionStoreReadOnlyUnavailableError(
+                "Session store requires maintenance; read-only access will not repair it") from exc
 
     try:
         return _open_probed()
@@ -200,12 +217,18 @@ def _session_db_path_for_profile(profile: Optional[str]) -> Path:
     return Path(_default_db_path())
 
 
-def _open_session_db_for_profile(profile: Optional[str], *, read_only: bool):
+def _open_session_db_for_profile(
+    profile: Optional[str], *, read_only: bool, strict_read_only: bool = False
+):
     """Open a SessionDB for ``profile`` (None/empty = this process's own state.db).
 
     Access-mode semantics: see :func:`_open_session_db_at_path`.
     """
-    return _open_session_db_at_path(_session_db_path_for_profile(profile), read_only=read_only)
+    return _open_session_db_at_path(
+        _session_db_path_for_profile(profile),
+        read_only=read_only,
+        strict_read_only=strict_read_only,
+    )
 
 
 # In-process throttle for the opportunistic auto-archive trigger, keyed by
